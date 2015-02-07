@@ -1,0 +1,54 @@
+#
+# By Chih-Wei Huang <cwhuang@linux.org.tw>
+# Last updated 2011/04/20
+#
+# License: GNU Public License
+# We explicitely grant the right to use the scripts
+# with Android-x86 project.
+#
+
+# An auto detect function provided by kinneko
+auto_detect()
+{
+  tmp=/tmp/dev2mod
+  echo 'dev2mod() { while read dev; do case $dev in' > $tmp
+  sort -r /lib/modules/`uname -r`/modules.alias | \
+	  sed -n 's/^alias  *\([^ ]*\)  *\(.*\)/\1)modprobe \2;;/p' >> $tmp
+  echo 'esac; done; }' >> $tmp
+  source $tmp
+  cat /sys/bus/*/devices/*/modalias | dev2mod
+  cat /sys/devices/virtual/wmi/*/modalias | dev2mod
+}
+
+
+
+find_network_dev_name()
+{
+  DHCPCD="/system/bin/dhcpcd -o domain_name_servers"
+  rmline=`grep -n "#REMOVE FROM HERE" init.rc|cut -d':' -f1`
+  rmline=`expr $rmline + 1`
+  sed -i -e "$rmline,\$d" init.rc
+  for netdev in `ls /sys/class/net`; do
+    if [ "$netdev" != "lo" -a "$netdev" != "wmaster0" ]; then
+      echo -e "service dhcpcd_$netdev $DHCPCD -ABKL\n   disabled\n   oneshot\n" >> init.rc
+      echo -e "service iprenew_$netdev $DHCPCD -n\n   disabled\n   oneshot\n" >> init.rc
+    fi
+  done
+}
+
+# Modified to boot on Amazon's ec2 platform
+# Author Claudiu Perta
+load_modules()
+{
+
+  if [ -n "$FOUND" ]; then
+    [ -n "$LANDEV" ] && modprobe $LANDEV
+  else
+	  auto_detect
+  fi
+
+  # Load the customized xen virtual frame buffer.
+  modprobe xenvfb
+
+  find_network_dev_name
+}

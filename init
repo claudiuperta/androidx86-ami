@@ -1,0 +1,212 @@
+#!/bin/busybox sh
+#
+# By Chih-Wei Huang <cwhuang@linux.org.tw>
+# and Thorsten Glaser <tg@mirbsd.org>
+#
+# Last updated 2011/08/18
+#
+# License: GNU Public License
+# We explicitely grant the right to use the scripts
+# with Android-x86 project.
+#
+
+PATH=/sbin:/bin:/system/bin:/system/xbin; export PATH
+
+# configure debugging output
+if [ -n "$DEBUG" ]; then
+  LOG=/tmp/log
+  set -x
+else
+  LOG=/dev/null
+  test -e "$LOG" || busybox mknod $LOG c 1 3
+fi
+exec 2>> $LOG
+
+# early boot
+if test x"$HAS_CTTY" != x"Yes"; then
+  # initialise /proc and /sys
+  busybox mount -t proc proc /proc
+  busybox mount -t sysfs sys /sys
+  # let busybox install all applets as symlinks
+  busybox --install -s
+  # spawn shells on tty 2 and 3 if debug or installer
+  if test -n "$DEBUG" || test -n "$INSTALL"; then
+    # ensure they can open a controlling tty
+    mknod /dev/tty c 5 0
+    # create device nodes then spawn on them
+    mknod /dev/tty2 c 4 2 && openvt
+    mknod /dev/tty3 c 4 3 && openvt
+  else
+    echo 0 0 0 0 > /proc/sys/kernel/printk
+  fi
+  # initialise /dev (first time)
+  echo /sbin/mdev > /proc/sys/kernel/hotplug
+  mdev -s
+  # re-run this script with a controlling tty
+  exec env HAS_CTTY=Yes setsid cttyhack /bin/sh "$0" "$@"
+fi
+
+# now running under a controlling tty; debug output from stderr into log file
+# boot up Android
+
+error()
+{
+  echo $*
+  return 1
+}
+
+try_mount()
+{
+  RW=$1; shift
+  # FIXME: any way to mount ntfs gracefully?
+  echo "mount -o $RW $@"
+  mount -o $RW $@ 2>&1 || mount.ntfs-3g -o rw,force $@
+}
+
+check_root()
+{
+  echo "Mounting ...."
+  if [ ! -f $1 ]; then
+    echo "$1 does not exist !"
+  fi
+
+  try_mount rw $1 /mnt && [ -e /mnt/$SRC/ramdisk.img ]
+  [ $? -ne 0 ] && return 1
+  echo "....done."
+
+  zcat /mnt/$SRC/ramdisk.img | cpio -id > /dev/null
+  if [ -e /mnt/$SRC/system.sfs ]; then
+
+    echo "Mounting system.fs..."
+    mount -o loop /mnt/$SRC/system.sfs /sfs
+    echo "...done."
+
+    echo "Mounting /sfs/system.img..."
+    mount -o loop /sfs/system.img system
+    echo "...done."
+
+  elif [ -e /mnt/$SRC/system.img ]; then
+
+    echo "Mounting system.img..."
+    mount -o loop /mnt/$SRC/system.img system
+    echo "...done."
+
+  elif [ -d /mnt/$SRC/system ]; then
+    echo "Mounting directory 'system'..."
+    remount_rw
+    mount --bind /mnt/$SRC/system system
+    echo "...done."
+  else
+    rm -rf *
+    return 1
+  fi
+  mkdir cache mnt mnt/sdcard
+  mount -t tmpfs tmpfs cache
+  echo " found at $1"
+}
+
+remount_rw()
+{
+  mount -o remount,rw /mnt
+}
+
+debug_shell()
+{
+  if which mksh >/dev/null 2>&1; then
+    echo Running MirBSD Korn Shell...
+    USER="($1)" mksh -l 2>&1
+  else
+    echo Running busybox ash...
+    sh 2>&1
+  fi
+}
+
+echo -n Detecting Android-x86...
+
+mount -t tmpfs tmpfs /android
+cd /android
+while :; do
+  for device in $(ls /dev/xvd*); do
+    echo "Checking root filesystem on device $device ..."
+    check_root $device && break 2
+    mountpoint -q /mnt && umount /mnt
+  done
+  sleep 1
+  echo -n .
+done
+
+ln -s mnt/$SRC /src
+ln -s android/system /
+ln -s ../system/lib/modules /lib
+ln -s ../system/lib/firmware /lib
+
+if [ -n "$INSTALL" ]; then
+  cd /
+  zcat /src/install.img | cpio -iud > /dev/null
+fi
+
+if [ -x system/bin/ln -a \( -n "$DEBUG" -o -n "$BUSYBOX" \) ]; then
+  mv /bin /lib .
+  system/bin/ln -s android/lib /lib
+  system/bin/ln -s android/bin /bin
+  sed -i 's|\(PATH *\)\(/sbin\)|\1/bin:\2|' init.rc
+  mv /sbin/* sbin
+  rmdir /sbin
+  ln -s android/sbin /
+fi
+
+# ensure keyboard driver is loaded
+[ -n "$INSTALL" -o -n "$DEBUG" ] && modprobe atkbd
+
+if [ -n "$DEBUG" ]; then
+  echo -e "\nType 'exit' to continue booting...\n"
+  debug_shell debug-found
+fi
+
+# load scripts
+for s in `ls /scripts/* /src/scripts/*`; do
+  test -e "$s" && source $s
+done
+
+# A target should provide its detect_hardware function.
+# On success, return 0 with the following values set.
+#
+# FB0DEV: framebuffer driver
+# LANDEV: lan driver
+# WIFDEV: wifi driver
+# SNDDEV: sound driver
+# CAMDEV: camera driver
+# PREDEV: any module the drivers depend on but can't be loaded automatically
+# EXTMOD: any other module
+
+[ "$AUTO" != "1" ] && detect_hardware && FOUND=1
+
+[ -n "$INSTALL" ] && do_install
+
+load_modules
+mount_data
+mount_sdcard
+setup_tslib
+post_detect
+
+if [ -n "$DEBUG" ]; then
+  echo -e "\nUse Alt-F1/F2/F3 to switch between virtual consoles"
+  echo -e "Type 'exit' to enter Android...\n"
+
+  debug_shell debug-late
+  SWITCH=chroot
+fi
+
+# We must disable mdev before switching to Android
+# since it conflicts with Android's init
+echo > /proc/sys/kernel/hotplug
+
+exec ${SWITCH:-switch_root} /android /init
+
+# avoid kernel panic
+while :; do
+  echo
+  echo '  Android-x86 console shell. Use only in emergencies.'
+  echo
+  debug_shell fatal-err
+done
